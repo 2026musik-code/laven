@@ -1,0 +1,6 @@
+{
+  "name": "Tusk Web Chat",
+  "description": "Web client for Tusk Central chat API, migrated from Python CLI",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
