@@ -2,21 +2,67 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 
 type Bindings = {
-  lavenai: KVNamespace;
+  lavenai: any; // KVNamespace
 };
 
 const app = new Hono<{ Bindings: Bindings }>();
 
 app.use("*", cors());
 
-const API_SOURCES: Record<string, string> = {
-  tusk: "https://tuskcentral.ai",
-  heck: "https://heck.ai",
-};
-
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)";
 
 // Helper functions for KV storage
+async function checkRateLimit(env: Bindings, token: string) {
+  // Fixed window rate limiting (per hour)
+  const currentHour = Math.floor(Date.now() / (1000 * 60 * 60));
+  const kvKey = `ratelimit:${token}:${currentHour}`;
+  
+  let count = parseInt(await env.lavenai.get(kvKey) || "0", 10);
+  
+  // Set limit: 100 requests per hour per key
+  const LIMIT = 100;
+  
+  if (count >= LIMIT) {
+    return false;
+  }
+  
+  // Expire after 2 hours to keep KV clean
+  await env.lavenai.put(kvKey, (count + 1).toString(), { expirationTtl: 3600 * 2 });
+  return true;
+}
+
+async function checkIpRateLimit(env: Bindings, ip: string) {
+  // Playground rate limit (per hour)
+  const currentHour = Math.floor(Date.now() / (1000 * 60 * 60));
+  const kvKey = `ratelimit_ip:${ip}:${currentHour}`;
+  
+  let count = parseInt(await env.lavenai.get(kvKey) || "0", 10);
+  
+  // Set limit: 50 requests per hour per IP for playground
+  const LIMIT = 50;
+  
+  if (count >= LIMIT) {
+    return false;
+  }
+  
+  await env.lavenai.put(kvKey, (count + 1).toString(), { expirationTtl: 3600 * 2 });
+  return true;
+}
+
+async function getProviderConfigs(env: Bindings) {
+  const configsStr = await env.lavenai.get("providerConfigs");
+  if (configsStr) {
+    return JSON.parse(configsStr);
+  }
+  
+  const defaultConfigs = {
+    tusk: "https://tuskcentral.ai",
+    heck: "https://api.heckai.weight-wave.com/api/ha"
+  };
+  await env.lavenai.put("providerConfigs", JSON.stringify(defaultConfigs));
+  return defaultConfigs;
+}
+
 async function getApiKeys(env: Bindings) {
   const keysStr = await env.lavenai.get("apiKeys");
   return keysStr ? JSON.parse(keysStr) : [{ key: "sk-default-key-for-testing", name: "Default Key", createdAt: Date.now() }];
@@ -90,6 +136,12 @@ async function authenticate(c: any) {
   if (!validKey) {
     return { error: "Invalid API key", status: 401 };
   }
+  
+  const isAllowed = await checkRateLimit(c.env, token);
+  if (!isAllowed) {
+    return { error: "Rate limit exceeded (100 requests / hour)", status: 429 };
+  }
+
   return { token };
 }
 
@@ -137,9 +189,11 @@ app.post("/v1/chat/completions", async (c) => {
     }));
   };
 
+  const configs = await getProviderConfigs(c.env);
+
   try {
     if (isHeck) {
-      const response = await fetch("https://api.heckai.weight-wave.com/api/ha/v1/chat", {
+      const response = await fetch(`${configs.heck}/v1/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ model: actualModel, question: prompt, language: "en" }),
@@ -223,7 +277,7 @@ app.post("/v1/chat/completions", async (c) => {
       }
     } else {
       // Tusk handling
-      const initResponse = await fetch(`${API_SOURCES.tusk}/api/v2/chat/conversations`, {
+      const initResponse = await fetch(`${configs.tusk}/api/v2/chat/conversations`, {
         method: "POST",
         headers: { "Accept": "application/json", "Content-Type": "application/json", "User-Agent": USER_AGENT, "use-tusk-header": "true" },
         body: JSON.stringify({ role: "user", content: "Init", aiModelId: actualModel, chatAiModelType: "text" }),
@@ -246,7 +300,7 @@ app.post("/v1/chat/completions", async (c) => {
         inputMode: "text",
       };
 
-      const chatResponse = await fetch(`${API_SOURCES.tusk}/api/V2/Chat`, {
+      const chatResponse = await fetch(`${configs.tusk}/api/V2/Chat`, {
         method: "POST",
         headers: { "Accept": "application/x-ndjson", "Content-Type": "application/json", "User-Agent": USER_AGENT, "use-tusk-header": "true" },
         body: JSON.stringify(payload),
@@ -362,7 +416,9 @@ app.get("/api/providers", async (c) => {
       });
     }
     
-    const baseUrl = API_SOURCES[apiSource] || API_SOURCES.tusk;
+    const configs = await getProviderConfigs(c.env);
+    // Since only Tusk provides a dynamic list, we use it directly:
+    const baseUrl = configs.tusk;
     
     const response = await fetch(`${baseUrl}/api/v2/chat/providers`, {
       headers: {
@@ -382,6 +438,12 @@ app.get("/api/providers", async (c) => {
 
 app.post("/api/conversations", async (c) => {
   try {
+    const ip = c.req.header("cf-connecting-ip") || "unknown-ip";
+    const isAllowed = await checkIpRateLimit(c.env, ip);
+    if (!isAllowed) {
+      return c.json({ error: "Playground rate limit exceeded (50 requests / hour). Please use API keys for higher limits." }, 429);
+    }
+
     const body = await c.req.json();
     const { modelId, apiSource = "tusk" } = body;
     
@@ -389,7 +451,8 @@ app.post("/api/conversations", async (c) => {
       return c.json({ chatId: apiSource + "-" + Date.now(), sessionId: apiSource + "-session" });
     }
 
-    const baseUrl = API_SOURCES.tusk;
+    const configs = await getProviderConfigs(c.env);
+    const baseUrl = configs.tusk;
     const response = await fetch(`${baseUrl}/api/v2/chat/conversations`, {
       method: "POST",
       headers: {
@@ -416,11 +479,19 @@ app.post("/api/conversations", async (c) => {
 
 app.post("/api/chat", async (c) => {
   try {
+    const ip = c.req.header("cf-connecting-ip") || "unknown-ip";
+    const isAllowed = await checkIpRateLimit(c.env, ip);
+    if (!isAllowed) {
+      return c.json({ error: "Playground rate limit exceeded (50 requests / hour). Please use API keys for higher limits." }, 429);
+    }
+
     const body = await c.req.json();
     const { chatId, sessionId, modelId, prompt, tone = "technical", apiSource = "tusk" } = body;
     
+    const configs = await getProviderConfigs(c.env);
+
     if (apiSource === "heck") {
-      const response = await fetch("https://api.heckai.weight-wave.com/api/ha/v1/chat", {
+      const response = await fetch(`${configs.heck}/v1/chat`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -473,7 +544,7 @@ app.post("/api/chat", async (c) => {
       });
     }
 
-    const baseUrl = API_SOURCES.tusk;
+    const baseUrl = configs.tusk;
     const payload = {
       role: "user",
       chatId: chatId,
