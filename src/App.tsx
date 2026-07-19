@@ -194,7 +194,7 @@ export default function App() {
     }
   };
 
-  const curlCommand = `curl -X POST https://your-gateway-url.com/v1/chat/completions \\
+  const curlCommand = `curl -X POST ${window.location.origin}/v1/chat/completions \\
   -H "Content-Type: application/json" \\
   -H "Authorization: Bearer \${API_KEY}" \\
   -d '{
