@@ -3,11 +3,23 @@ import { cors } from "hono/cors";
 
 type Bindings = {
   lavenai: any; // KVNamespace
+  ADMIN_SECRET: string;
 };
 
 const app = new Hono<{ Bindings: Bindings }>();
 
-app.use("*", cors());
+app.use("*", cors((c) => {
+  const origin = c.req.header("origin");
+  const allowedOrigins = [
+    "http://localhost:3000",
+    "http://localhost:5173",
+    "https://laven.vipcf.workers.dev"
+  ];
+  if (origin && allowedOrigins.includes(origin)) {
+    return origin;
+  }
+  return "https://laven.vipcf.workers.dev"; // default fallback
+}));
 
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)";
 
@@ -65,7 +77,7 @@ async function getProviderConfigs(env: Bindings) {
 
 async function getApiKeys(env: Bindings) {
   const keysStr = await env.lavenai.get("apiKeys");
-  return keysStr ? JSON.parse(keysStr) : [{ key: "sk-default-key-for-testing", name: "Default Key", createdAt: Date.now() }];
+  return keysStr ? JSON.parse(keysStr) : [];
 }
 
 async function saveApiKeys(env: Bindings, keys: any[]) {
@@ -85,6 +97,28 @@ async function addLog(env: Bindings, log: any) {
   }
   await env.lavenai.put("requestLogs", JSON.stringify(logs));
 }
+
+// Admin Auth Middleware
+app.use("/api/admin/*", async (c, next) => {
+  const ip = c.req.header("cf-connecting-ip") || "unknown-ip";
+  const isAllowed = await checkIpRateLimit(c.env, ip);
+  if (!isAllowed) {
+    return c.json({ error: "Rate limit exceeded" }, 429);
+  }
+
+  const authHeader = c.req.header("authorization");
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    return c.json({ error: "Missing admin secret" }, 401);
+  }
+  const token = authHeader.split(" ")[1];
+  
+  // Verify with environment variable
+  if (!c.env.ADMIN_SECRET || token !== c.env.ADMIN_SECRET) {
+    return c.json({ error: "Invalid admin secret" }, 403);
+  }
+  
+  await next();
+});
 
 // Admin API Keys Management
 app.get("/api/admin/keys", async (c) => {

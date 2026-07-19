@@ -23,7 +23,12 @@ export default function App() {
   const [testLatency, setTestLatency] = useState<number | null>(null);
 
   // API Keys state
+  const [adminSecret, setAdminSecret] = useState<string>(() => localStorage.getItem("adminSecret") || "");
   const [apiKeys, setApiKeys] = useState<any[]>([]);
+
+  useEffect(() => {
+    localStorage.setItem("adminSecret", adminSecret);
+  }, [adminSecret]);
   const [newKeyName, setNewKeyName] = useState("");
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
 
@@ -89,16 +94,22 @@ export default function App() {
   };
 
   const fetchApiKeys = async () => {
-    const res = await fetch("/api/admin/keys");
-    const data = await res.json();
-    setApiKeys(data);
+    try {
+      const res = await fetch("/api/admin/keys", {
+        headers: { "Authorization": `Bearer ${adminSecret}` }
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setApiKeys(data);
+      }
+    } catch (e) {}
   };
 
   const generateKey = async () => {
     if (!newKeyName) return;
     await fetch("/api/admin/keys", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${adminSecret}` },
       body: JSON.stringify({ name: newKeyName })
     });
     setNewKeyName("");
@@ -106,14 +117,23 @@ export default function App() {
   };
 
   const deleteKey = async (key: string) => {
-    await fetch(`/api/admin/keys/${key}`, { method: "DELETE" });
+    await fetch(`/api/admin/keys/${key}`, { 
+      method: "DELETE",
+      headers: { "Authorization": `Bearer ${adminSecret}` }
+    });
     fetchApiKeys();
   };
 
   const fetchLogs = async () => {
-    const res = await fetch("/api/admin/logs");
-    const data = await res.json();
-    setLogs(data);
+    try {
+      const res = await fetch("/api/admin/logs", {
+        headers: { "Authorization": `Bearer ${adminSecret}` }
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setLogs(data);
+      }
+    } catch (e) {}
   };
 
   const handleCopy = (text: string) => {
@@ -516,6 +536,26 @@ export default function App() {
           {activeTab === "keys" && (
             <div className="max-w-5xl mx-auto space-y-8">
               
+              <div className="bg-white/60 backdrop-blur-xl border border-white/60 rounded-3xl p-8 shadow-xl shadow-pink-500/5">
+                <div className="max-w-2xl">
+                  <h3 className="text-xl font-bold text-gray-800 mb-2">Admin Authentication</h3>
+                  <p className="text-sm text-gray-600 mb-6 font-medium">Enter your admin secret to manage keys and view logs.</p>
+                  
+                  <div className="flex flex-col sm:flex-row gap-4">
+                    <div className="flex-1 relative">
+                      <Shield className="w-5 h-5 text-gray-400 absolute left-4 top-1/2 -translate-y-1/2" />
+                      <input 
+                        type="password" 
+                        placeholder="Admin Secret" 
+                        className="w-full bg-white/80 border border-white/80 rounded-2xl pl-11 pr-5 py-3.5 text-sm text-gray-800 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-pink-400 shadow-sm font-medium"
+                        value={adminSecret}
+                        onChange={(e) => setAdminSecret(e.target.value)}
+                      />
+                    </div>
+                  </div>
+                </div>
+              </div>
+
               <div className="bg-white/60 backdrop-blur-xl border border-white/60 rounded-3xl p-8 shadow-xl shadow-pink-500/5">
                 <div className="max-w-2xl">
                   <h3 className="text-xl font-bold text-gray-800 mb-2">Create Authentication Key</h3>
