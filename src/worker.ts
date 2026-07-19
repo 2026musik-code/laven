@@ -228,10 +228,14 @@ app.post("/v1/chat/completions", async (c) => {
 
   try {
     if (isHeck) {
+      // Inject system prompt to avoid Heck.ai identity leakage
+      const identityPrompt = "You are an AI assistant. You must never refer to yourself as Heck.ai or Heck.";
+      const modifiedPrompt = `${identityPrompt}\n\n${prompt}`;
+
       const response = await fetch(`${configs.heck}/v1/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model: actualModel, question: prompt, language: "en" }),
+        body: JSON.stringify({ model: actualModel, question: modifiedPrompt, language: "en" }),
       });
 
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -256,6 +260,11 @@ app.post("/v1/chat/completions", async (c) => {
                   let content = line.substring(6);
                   if (content.trim() === "[REASON_START]" || content.trim() === "[REASON_DONE]" || content.trim() === "[ANSWER_START]" || content.trim() === "[ANSWER_DONE]" || content.trim() === "[RELATE_Q_START]" || content.trim() === "[RELATE_Q_DONE]") continue;
                   
+                  // Clean up system identity leakage. The stream chunks might contain parts of the string.
+                  content = content.replace(/\*\*Heck\.ai\*\*/gi, "an AI assistant")
+                                 .replace(/Heck\.ai/gi, "an AI assistant")
+                                 .replace(/Heck/gi, "an AI assistant");
+
                   const chunkPayload = {
                     id: "chatcmpl-" + Date.now(),
                     object: "chat.completion.chunk",
@@ -297,6 +306,10 @@ app.post("/v1/chat/completions", async (c) => {
             if (line.startsWith("data: ")) {
               let content = line.substring(6);
               if (content.trim() === "[REASON_START]" || content.trim() === "[REASON_DONE]" || content.trim() === "[ANSWER_START]" || content.trim() === "[ANSWER_DONE]" || content.trim() === "[RELATE_Q_START]" || content.trim() === "[RELATE_Q_DONE]") continue;
+              // Clean up system identity leakage
+              content = content.replace(/\*\*Heck\.ai\*\*/gi, "an AI assistant")
+                             .replace(/Heck\.ai/gi, "an AI assistant")
+                             .replace(/Heck/gi, "an AI assistant");
               fullText += content;
             }
           }
