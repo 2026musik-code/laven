@@ -8,17 +8,18 @@ type Bindings = {
 
 const app = new Hono<{ Bindings: Bindings }>();
 
-app.use("*", cors((c) => {
-  const origin = c.req.header("origin");
-  const allowedOrigins = [
-    "http://localhost:3000",
-    "http://localhost:5173",
-    "https://laven.vipcf.workers.dev"
-  ];
-  if (origin && allowedOrigins.includes(origin)) {
-    return origin;
+app.use("*", cors({
+  origin: (origin) => {
+    const allowedOrigins = [
+      "http://localhost:3000",
+      "http://localhost:5173",
+      "https://laven.vipcf.workers.dev"
+    ];
+    if (origin && allowedOrigins.includes(origin)) {
+      return origin;
+    }
+    return "https://laven.vipcf.workers.dev"; // default fallback
   }
-  return "https://laven.vipcf.workers.dev"; // default fallback
 }));
 
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)";
