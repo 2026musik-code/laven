@@ -8,39 +8,45 @@ type Bindings = {
 
 const app = new Hono<{ Bindings: Bindings }>();
 
-app.use("*", cors({
-  origin: (origin) => {
-    const allowedOrigins = [
-      "http://localhost:3000",
-      "http://localhost:5173",
-      "https://laven.vipcf.workers.dev"
-    ];
-    if (origin && allowedOrigins.includes(origin)) {
-      return origin;
-    }
-    return "https://laven.vipcf.workers.dev"; // default fallback
-  }
-}));
+app.use(
+  "*",
+  cors({
+    origin: (origin) => {
+      const allowedOrigins = [
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "https://laven.vipcf.workers.dev",
+      ];
+      if (origin && allowedOrigins.includes(origin)) {
+        return origin;
+      }
+      return "https://laven.vipcf.workers.dev"; // default fallback
+    },
+  }),
+);
 
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)";
 
 // Helper functions for KV storage
-async function checkRateLimit(env: Bindings, token: string) {
+async function checkRateLimit(
+  env: Bindings,
+  token: string,
+  limit: number = 100,
+) {
   // Fixed window rate limiting (per hour)
   const currentHour = Math.floor(Date.now() / (1000 * 60 * 60));
   const kvKey = `ratelimit:${token}:${currentHour}`;
-  
-  let count = parseInt(await env.lavenai.get(kvKey) || "0", 10);
-  
-  // Set limit: 100 requests per hour per key
-  const LIMIT = 100;
-  
-  if (count >= LIMIT) {
+
+  let count = parseInt((await env.lavenai.get(kvKey)) || "0", 10);
+
+  if (count >= limit) {
     return false;
   }
-  
+
   // Expire after 2 hours to keep KV clean
-  await env.lavenai.put(kvKey, (count + 1).toString(), { expirationTtl: 3600 * 2 });
+  await env.lavenai.put(kvKey, (count + 1).toString(), {
+    expirationTtl: 3600 * 2,
+  });
   return true;
 }
 
@@ -48,17 +54,19 @@ async function checkIpRateLimit(env: Bindings, ip: string) {
   // Playground rate limit (per hour)
   const currentHour = Math.floor(Date.now() / (1000 * 60 * 60));
   const kvKey = `ratelimit_ip:${ip}:${currentHour}`;
-  
-  let count = parseInt(await env.lavenai.get(kvKey) || "0", 10);
-  
+
+  let count = parseInt((await env.lavenai.get(kvKey)) || "0", 10);
+
   // Set limit: 50 requests per hour per IP for playground
   const LIMIT = 50;
-  
+
   if (count >= LIMIT) {
     return false;
   }
-  
-  await env.lavenai.put(kvKey, (count + 1).toString(), { expirationTtl: 3600 * 2 });
+
+  await env.lavenai.put(kvKey, (count + 1).toString(), {
+    expirationTtl: 3600 * 2,
+  });
   return true;
 }
 
@@ -67,10 +75,10 @@ async function getProviderConfigs(env: Bindings) {
   if (configsStr) {
     return JSON.parse(configsStr);
   }
-  
+
   const defaultConfigs = {
     tusk: "https://tuskcentral.ai",
-    heck: "https://api.heckai.weight-wave.com/api/ha"
+    heck: "https://api.heckai.weight-wave.com/api/ha",
   };
   await env.lavenai.put("providerConfigs", JSON.stringify(defaultConfigs));
   return defaultConfigs;
@@ -112,18 +120,34 @@ app.use("/api/admin/*", async (c, next) => {
     return c.json({ error: "Missing admin secret" }, 401);
   }
   const token = authHeader.split(" ")[1];
-  
-  // Verify with environment variable
-  if (!c.env.ADMIN_SECRET || token !== c.env.ADMIN_SECRET) {
+
+  // Verify with KV or environment variable
+  const kvAdminSecret = await c.env.lavenai.get("adminSecret");
+  const actualSecret = kvAdminSecret || c.env.ADMIN_SECRET;
+  if (!actualSecret || token !== actualSecret) {
     return c.json({ error: "Invalid admin secret" }, 403);
   }
-  
+
   await next();
 });
+
+async function getRedeemCodes(env: Bindings) {
+  const str = await env.lavenai.get("redeemCodes");
+  return str ? JSON.parse(str) : [];
+}
+async function saveRedeemCodes(env: Bindings, codes: any[]) {
+  await env.lavenai.put("redeemCodes", JSON.stringify(codes));
+}
 
 // Admin API Keys Management
 app.get("/api/admin/keys", async (c) => {
   const keys = await getApiKeys(c.env);
+  for (let key of keys) {
+    key.requests = parseInt(
+      (await c.env.lavenai.get(`usage:${key.key}`)) || "0",
+      10,
+    );
+  }
   return c.json(keys);
 });
 
@@ -133,11 +157,56 @@ app.post("/api/admin/keys", async (c) => {
   const newKey = {
     key: "sk-" + crypto.randomUUID().replace(/-/g, ""),
     name: body.name || "New Key",
+    user: body.user || body.name || "Unknown",
+    limit: body.limit || 100,
     createdAt: Date.now(),
   };
   keys.push(newKey);
   await saveApiKeys(c.env, keys);
   return c.json(newKey);
+});
+
+app.post("/api/admin/change-token", async (c) => {
+  const body = await c.req.json();
+  if (body.newToken) {
+    await c.env.lavenai.put("adminSecret", body.newToken);
+    return c.json({ success: true });
+  }
+  return c.json({ error: "Missing newToken" }, 400);
+});
+
+app.get("/api/admin/codes", async (c) => {
+  const codes = await getRedeemCodes(c.env);
+  return c.json(codes);
+});
+
+app.post("/api/admin/codes", async (c) => {
+  const body = await c.req.json();
+  const codes = await getRedeemCodes(c.env);
+  const newCode = {
+    code:
+      body.code ||
+      "LAVEN-" +
+        crypto.randomUUID().split("-")[0].toUpperCase().substring(0, 8),
+    limit: body.limit || 100,
+    used: false,
+    createdAt: Date.now(),
+  };
+  codes.push(newCode);
+  await saveRedeemCodes(c.env, codes);
+  return c.json(newCode);
+});
+
+app.delete("/api/admin/codes/:code", async (c) => {
+  const codeToRemove = c.req.param("code");
+  const codes = await getRedeemCodes(c.env);
+  const index = codes.findIndex((k: any) => k.code === codeToRemove);
+  if (index !== -1) {
+    codes.splice(index, 1);
+    await saveRedeemCodes(c.env, codes);
+    return c.json({ success: true });
+  }
+  return c.json({ error: "Code not found" }, 404);
 });
 
 app.delete("/api/admin/keys/:key", async (c) => {
@@ -153,7 +222,38 @@ app.delete("/api/admin/keys/:key", async (c) => {
   }
 });
 
+app.post("/api/redeem", async (c) => {
+  const body = await c.req.json();
+  const { code, user } = body;
+  if (!code || !user) return c.json({ error: "Missing code or user" }, 400);
+
+  const codes = await getRedeemCodes(c.env);
+  const codeIndex = codes.findIndex((k: any) => k.code === code);
+
+  if (codeIndex === -1) return c.json({ error: "Invalid code" }, 400);
+  if (codes[codeIndex].used) return c.json({ error: "Code already used" }, 400);
+
+  codes[codeIndex].used = true;
+  codes[codeIndex].usedBy = user;
+  codes[codeIndex].usedAt = Date.now();
+  await saveRedeemCodes(c.env, codes);
+
+  const keys = await getApiKeys(c.env);
+  const newKey = {
+    key: "sk-" + crypto.randomUUID().replace(/-/g, ""),
+    name: user,
+    user: user,
+    limit: codes[codeIndex].limit || 100,
+    createdAt: Date.now(),
+  };
+  keys.push(newKey);
+  await saveApiKeys(c.env, keys);
+
+  return c.json(newKey);
+});
+
 // Admin Logs
+
 app.get("/api/admin/logs", async (c) => {
   const logs = await getLogs(c.env);
   return c.json(logs.slice(-100).reverse());
@@ -171,11 +271,26 @@ async function authenticate(c: any) {
   if (!validKey) {
     return { error: "Invalid API key", status: 401 };
   }
-  
-  const isAllowed = await checkRateLimit(c.env, token);
+
+  const limit = validKey.limit || 100;
+  const isAllowed = await checkRateLimit(c.env, token, limit);
   if (!isAllowed) {
-    return { error: "Rate limit exceeded (100 requests / hour)", status: 429 };
+    return {
+      error: `Rate limit exceeded (${limit} requests / hour)`,
+      status: 429,
+    };
   }
+
+  // Update total usage
+  c.executionCtx.waitUntil(
+    (async () => {
+      let usage = parseInt(
+        (await c.env.lavenai.get(`usage:${token}`)) || "0",
+        10,
+      );
+      await c.env.lavenai.put(`usage:${token}`, (usage + 1).toString());
+    })(),
+  );
 
   return { token };
 }
@@ -183,15 +298,31 @@ async function authenticate(c: any) {
 // OpenAI-Compatible Models Endpoint
 app.get("/v1/models", async (c) => {
   const auth = await authenticate(c);
-  if (auth.error) return c.json({ error: { message: auth.error } }, auth.status as any);
+  if (auth.error)
+    return c.json({ error: { message: auth.error } }, auth.status as any);
 
   return c.json({
     object: "list",
     data: [
-      { id: "heck/deepseek/deepseek-v4-flash", object: "model", created: Date.now(), owned_by: "heck" },
-      { id: "heck/google/gemini-3.1-pro-preview", object: "model", created: Date.now(), owned_by: "heck" },
-      { id: "tusk/some-model", object: "model", created: Date.now(), owned_by: "tusk" },
-    ]
+      {
+        id: "heck/deepseek/deepseek-v4-flash",
+        object: "model",
+        created: Date.now(),
+        owned_by: "heck",
+      },
+      {
+        id: "heck/google/gemini-3.1-pro-preview",
+        object: "model",
+        created: Date.now(),
+        owned_by: "heck",
+      },
+      {
+        id: "tusk/some-model",
+        object: "model",
+        created: Date.now(),
+        owned_by: "tusk",
+      },
+    ],
   });
 });
 
@@ -199,7 +330,8 @@ app.get("/v1/models", async (c) => {
 app.post("/v1/chat/completions", async (c) => {
   const startTime = Date.now();
   const auth = await authenticate(c);
-  if (auth.error) return c.json({ error: { message: auth.error } }, auth.status as any);
+  if (auth.error)
+    return c.json({ error: { message: auth.error } }, auth.status as any);
 
   const apiKey = auth.token;
   const body = await c.req.json();
@@ -210,18 +342,24 @@ app.post("/v1/chat/completions", async (c) => {
   }
 
   const isHeck = model.includes("heck/");
-  const actualModel = model.replace("laven-heck/", "").replace("laven-tusk/", "").replace("heck/", "").replace("tusk/", "");
+  const actualModel = model
+    .replace("laven-heck/", "")
+    .replace("laven-tusk/", "")
+    .replace("heck/", "")
+    .replace("tusk/", "");
   const prompt = messages.map((m: any) => `${m.role}: ${m.content}`).join("\n");
 
   const logRequest = async (status: number) => {
-    c.executionCtx.waitUntil(addLog(c.env, {
-      id: crypto.randomUUID(),
-      timestamp: startTime,
-      key: apiKey,
-      model: model,
-      durationMs: Date.now() - startTime,
-      status,
-    }));
+    c.executionCtx.waitUntil(
+      addLog(c.env, {
+        id: crypto.randomUUID(),
+        timestamp: startTime,
+        key: apiKey,
+        model: model,
+        durationMs: Date.now() - startTime,
+        status,
+      }),
+    );
   };
 
   const configs = await getProviderConfigs(c.env);
@@ -229,13 +367,18 @@ app.post("/v1/chat/completions", async (c) => {
   try {
     if (isHeck) {
       // Inject system prompt to avoid Heck.ai identity leakage
-      const identityPrompt = "You are an AI assistant. You must never refer to yourself as Heck.ai or Heck.";
+      const identityPrompt =
+        "You are an AI assistant. You must never refer to yourself as Heck.ai or Heck.";
       const modifiedPrompt = `${identityPrompt}\n\n${prompt}`;
 
       const response = await fetch(`${configs.heck}/v1/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model: actualModel, question: modifiedPrompt, language: "en" }),
+        body: JSON.stringify({
+          model: actualModel,
+          question: modifiedPrompt,
+          language: "en",
+        }),
       });
 
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -246,77 +389,181 @@ app.post("/v1/chat/completions", async (c) => {
         const writer = writable.getWriter();
         const encoder = new TextEncoder();
 
-        c.executionCtx.waitUntil((async () => {
-          const reader = response.body!.getReader();
-          const decoder = new TextDecoder("utf-8");
-          try {
-            let buffer = "";
-               while (true) {
-              const { done, value } = await reader.read();
-              if (done) break;
-            buffer += decoder.decode(value, { stream: true });
-            const lines = buffer.split("\n");
-            buffer = lines.pop() || "";
-              for (const line of lines) {
-                if (line.startsWith("data: ")) {
-                  let content = line.substring(6);
-                  if (content.trim() === "[REASON_START]" || content.trim() === "[REASON_DONE]" || content.trim() === "[ANSWER_START]" || content.trim() === "[ANSWER_DONE]" || content.trim() === "[RELATE_Q_START]" || content.trim() === "[RELATE_Q_DONE]") continue;
-                  
-                  // Clean up system identity leakage. The stream chunks might contain parts of the string.
-                  content = content.replace(/\*\*Heck\.ai\*\*/gi, "an AI assistant")
-                                 .replace(/Heck\.ai/gi, "an AI assistant")
-                                 .replace(/Heck/gi, "an AI assistant");
+        c.executionCtx.waitUntil(
+          (async () => {
+            const reader = response.body!.getReader();
+            const decoder = new TextDecoder("utf-8");
+            try {
+              let buffer = "";
+              while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split("\n");
+                buffer = lines.pop() || "";
+                for (const line of lines) {
+                  if (line.startsWith("data: ")) {
+                    let content = line.substring(6);
+                    if (
+                      content.trim() === "[REASON_START]" ||
+                      content.trim() === "[REASON_DONE]" ||
+                      content.trim() === "[ANSWER_START]" ||
+                      content.trim() === "[ANSWER_DONE]" ||
+                      content.trim() === "[RELATE_Q_START]" ||
+                      content.trim() === "[RELATE_Q_DONE]"
+                    )
+                      continue;
 
+                    // Clean up system identity leakage. The stream chunks might contain parts of the string.
+                    content = content
+                      .replace(/\*\*Heck\.ai\*\*/gi, "an AI assistant")
+                      .replace(/Heck\.ai/gi, "an AI assistant")
+                      .replace(/Heck/gi, "an AI assistant");
+
+                    const chunkPayload = {
+                      id: "chatcmpl-" + Date.now(),
+                      object: "chat.completion.chunk",
+                      created: Date.now(),
+                      model: model,
+                      choices: [
+                        { index: 0, delta: { content }, finish_reason: null },
+                      ],
+                    };
+                    await writer.write(
+                      encoder.encode(
+                        `data: ${JSON.stringify(chunkPayload)}\n\n`,
+                      ),
+                    );
+                  }
+                }
+              }
+              if (buffer.startsWith("data: ")) {
+                let content = buffer.substring(6);
+                if (!(
+                  content.trim() === "[REASON_START]" ||
+                  content.trim() === "[REASON_DONE]" ||
+                  content.trim() === "[ANSWER_START]" ||
+                  content.trim() === "[ANSWER_DONE]" ||
+                  content.trim() === "[RELATE_Q_START]" ||
+                  content.trim() === "[RELATE_Q_DONE]"
+                )) {
+                  content = content
+                    .replace(/\*\*Heck\.ai\*\*/gi, "an AI assistant")
+                    .replace(/Heck\.ai/gi, "an AI assistant")
+                    .replace(/Heck/gi, "an AI assistant");
                   const chunkPayload = {
                     id: "chatcmpl-" + Date.now(),
                     object: "chat.completion.chunk",
                     created: Date.now(),
                     model: model,
-                    choices: [{ index: 0, delta: { content }, finish_reason: null }]
+                    choices: [
+                      { index: 0, delta: { content }, finish_reason: null },
+                    ],
                   };
-                  await writer.write(encoder.encode(`data: ${JSON.stringify(chunkPayload)}\n\n`));
+                  await writer.write(
+                    encoder.encode(`data: ${JSON.stringify(chunkPayload)}\n\n`),
+                  );
                 }
               }
+              if (buffer.trim()) {
+                try {
+                  const data = JSON.parse(buffer);
+                  if (data.content) {
+                    const chunkPayload = {
+                      id: "chatcmpl-" + Date.now(),
+                      object: "chat.completion.chunk",
+                      created: Date.now(),
+                      model: model,
+                      choices: [
+                        {
+                          index: 0,
+                          delta: { content: JSON.parse(data.content).content },
+                          finish_reason: null,
+                        },
+                      ],
+                    };
+                    await writer.write(
+                      encoder.encode(
+                        `data: ${JSON.stringify(chunkPayload)}\n\n`,
+                      ),
+                    );
+                  }
+                } catch (e) {}
+              }
+              await writer.write(encoder.encode("data: [DONE]\n\n"));
+              await logRequest(200);
+            } catch (err) {
+              console.error(err);
+              await logRequest(500);
+            } finally {
+              await writer.close();
             }
-            await writer.write(encoder.encode("data: [DONE]\n\n"));
-            await logRequest(200);
-          } catch (err) {
-            console.error(err);
-            await logRequest(500);
-          } finally {
-            await writer.close();
-          }
-        })());
+          })(),
+        );
 
         return new Response(readable, {
           headers: {
             "Content-Type": "text/event-stream",
             "Cache-Control": "no-cache",
-            "Connection": "keep-alive"
-          }
+            Connection: "keep-alive",
+          },
         });
       } else {
         const reader = response.body.getReader();
         const decoder = new TextDecoder("utf-8");
         let fullText = "";
         let buffer = "";
-           while (true) {
+        while (true) {
           const { done, value } = await reader.read();
           if (done) break;
-            buffer += decoder.decode(value, { stream: true });
-            const lines = buffer.split("\n");
-            buffer = lines.pop() || "";
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop() || "";
           for (const line of lines) {
             if (line.startsWith("data: ")) {
               let content = line.substring(6);
-              if (content.trim() === "[REASON_START]" || content.trim() === "[REASON_DONE]" || content.trim() === "[ANSWER_START]" || content.trim() === "[ANSWER_DONE]" || content.trim() === "[RELATE_Q_START]" || content.trim() === "[RELATE_Q_DONE]") continue;
+              if (
+                content.trim() === "[REASON_START]" ||
+                content.trim() === "[REASON_DONE]" ||
+                content.trim() === "[ANSWER_START]" ||
+                content.trim() === "[ANSWER_DONE]" ||
+                content.trim() === "[RELATE_Q_START]" ||
+                content.trim() === "[RELATE_Q_DONE]"
+              )
+                continue;
               // Clean up system identity leakage
-              content = content.replace(/\*\*Heck\.ai\*\*/gi, "an AI assistant")
-                             .replace(/Heck\.ai/gi, "an AI assistant")
-                             .replace(/Heck/gi, "an AI assistant");
+              content = content
+                .replace(/\*\*Heck\.ai\*\*/gi, "an AI assistant")
+                .replace(/Heck\.ai/gi, "an AI assistant")
+                .replace(/Heck/gi, "an AI assistant");
               fullText += content;
             }
           }
+        }
+        if (buffer.startsWith("data: ")) {
+          let content = buffer.substring(6);
+          if (!(
+            content.trim() === "[REASON_START]" ||
+            content.trim() === "[REASON_DONE]" ||
+            content.trim() === "[ANSWER_START]" ||
+            content.trim() === "[ANSWER_DONE]" ||
+            content.trim() === "[RELATE_Q_START]" ||
+            content.trim() === "[RELATE_Q_DONE]"
+          )) {
+            content = content
+              .replace(/\*\*Heck\.ai\*\*/gi, "an AI assistant")
+              .replace(/Heck\.ai/gi, "an AI assistant")
+              .replace(/Heck/gi, "an AI assistant");
+            fullText += content;
+          }
+        }
+        if (buffer.trim()) {
+          try {
+            const data = JSON.parse(buffer);
+            if (data.content) {
+              fullText += JSON.parse(data.content).content;
+            }
+          } catch (e) {}
         }
         await logRequest(200);
         return c.json({
@@ -324,19 +571,38 @@ app.post("/v1/chat/completions", async (c) => {
           object: "chat.completion",
           created: Date.now(),
           model: model,
-          choices: [{ index: 0, message: { role: "assistant", content: fullText }, finish_reason: "stop" }]
+          choices: [
+            {
+              index: 0,
+              message: { role: "assistant", content: fullText },
+              finish_reason: "stop",
+            },
+          ],
         });
       }
     } else {
       // Tusk handling
-      const initResponse = await fetch(`${configs.tusk}/api/v2/chat/conversations`, {
-        method: "POST",
-        headers: { "Accept": "application/json", "Content-Type": "application/json", "User-Agent": USER_AGENT, "use-tusk-header": "true" },
-        body: JSON.stringify({ role: "user", content: "Init", aiModelId: actualModel, chatAiModelType: "text" }),
-      });
+      const initResponse = await fetch(
+        `${configs.tusk}/api/v2/chat/conversations`,
+        {
+          method: "POST",
+          headers: {
+            Accept: "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": USER_AGENT,
+            "use-tusk-header": "true",
+          },
+          body: JSON.stringify({
+            role: "user",
+            content: "Init",
+            aiModelId: actualModel,
+            chatAiModelType: "text",
+          }),
+        },
+      );
       if (!initResponse.ok) throw new Error("Failed to create conversation");
-      const convData = await initResponse.json() as any;
-      
+      const convData = (await initResponse.json()) as any;
+
       const payload = {
         role: "user",
         chatId: convData.chatId,
@@ -354,7 +620,12 @@ app.post("/v1/chat/completions", async (c) => {
 
       const chatResponse = await fetch(`${configs.tusk}/api/V2/Chat`, {
         method: "POST",
-        headers: { "Accept": "application/x-ndjson", "Content-Type": "application/json", "User-Agent": USER_AGENT, "use-tusk-header": "true" },
+        headers: {
+          Accept: "application/x-ndjson",
+          "Content-Type": "application/json",
+          "User-Agent": USER_AGENT,
+          "use-tusk-header": "true",
+        },
         body: JSON.stringify(payload),
       });
 
@@ -366,63 +637,77 @@ app.post("/v1/chat/completions", async (c) => {
         const writer = writable.getWriter();
         const encoder = new TextEncoder();
 
-        c.executionCtx.waitUntil((async () => {
-          const reader = chatResponse.body!.getReader();
-          const decoder = new TextDecoder("utf-8");
-          try {
-            let buffer = "";
-               while (true) {
-              const { done, value } = await reader.read();
-              if (done) break;
-            buffer += decoder.decode(value, { stream: true });
-            const lines = buffer.split("\n");
-            buffer = lines.pop() || "";
-              for (let line of lines) {
-                if (line.trim()) {
-                  try {
-                    const data = JSON.parse(line);
-                    if (data.content) {
-                      const chunkPayload = {
-                        id: "chatcmpl-" + Date.now(),
-                        object: "chat.completion.chunk",
-                        created: Date.now(),
-                        model: model,
-                        choices: [{ index: 0, delta: { content: JSON.parse(data.content).content }, finish_reason: null }]
-                      };
-                      await writer.write(encoder.encode(`data: ${JSON.stringify(chunkPayload)}\n\n`));
-                    }
-                  } catch(e) {}
+        c.executionCtx.waitUntil(
+          (async () => {
+            const reader = chatResponse.body!.getReader();
+            const decoder = new TextDecoder("utf-8");
+            try {
+              let buffer = "";
+              while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split("\n");
+                buffer = lines.pop() || "";
+                for (let line of lines) {
+                  if (line.trim()) {
+                    try {
+                      const data = JSON.parse(line);
+                      if (data.content) {
+                        const chunkPayload = {
+                          id: "chatcmpl-" + Date.now(),
+                          object: "chat.completion.chunk",
+                          created: Date.now(),
+                          model: model,
+                          choices: [
+                            {
+                              index: 0,
+                              delta: {
+                                content: JSON.parse(data.content).content,
+                              },
+                              finish_reason: null,
+                            },
+                          ],
+                        };
+                        await writer.write(
+                          encoder.encode(
+                            `data: ${JSON.stringify(chunkPayload)}\n\n`,
+                          ),
+                        );
+                      }
+                    } catch (e) {}
+                  }
                 }
               }
+              await writer.write(encoder.encode("data: [DONE]\n\n"));
+              await logRequest(200);
+            } catch (err) {
+              console.error(err);
+              await logRequest(500);
+            } finally {
+              await writer.close();
             }
-            await writer.write(encoder.encode("data: [DONE]\n\n"));
-            await logRequest(200);
-          } catch (err) {
-            console.error(err);
-            await logRequest(500);
-          } finally {
-            await writer.close();
-          }
-        })());
+          })(),
+        );
 
         return new Response(readable, {
           headers: {
             "Content-Type": "text/event-stream",
             "Cache-Control": "no-cache",
-            "Connection": "keep-alive"
-          }
+            Connection: "keep-alive",
+          },
         });
       } else {
         let fullText = "";
         const reader = chatResponse.body.getReader();
         const decoder = new TextDecoder("utf-8");
         let buffer = "";
-           while (true) {
+        while (true) {
           const { done, value } = await reader.read();
           if (done) break;
-            buffer += decoder.decode(value, { stream: true });
-            const lines = buffer.split("\n");
-            buffer = lines.pop() || "";
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop() || "";
           for (let line of lines) {
             if (line.trim()) {
               try {
@@ -430,7 +715,7 @@ app.post("/v1/chat/completions", async (c) => {
                 if (data.content) {
                   fullText += JSON.parse(data.content).content;
                 }
-              } catch(e) {}
+              } catch (e) {}
             }
           }
         }
@@ -440,7 +725,13 @@ app.post("/v1/chat/completions", async (c) => {
           object: "chat.completion",
           created: Date.now(),
           model: model,
-          choices: [{ index: 0, message: { role: "assistant", content: fullText }, finish_reason: "stop" }]
+          choices: [
+            {
+              index: 0,
+              message: { role: "assistant", content: fullText },
+              finish_reason: "stop",
+            },
+          ],
         });
       }
     }
@@ -454,31 +745,81 @@ app.post("/v1/chat/completions", async (c) => {
 app.get("/api/providers", async (c) => {
   try {
     const apiSource = c.req.query("apiSource") || "tusk";
-    
+
     if (apiSource === "heck") {
       return c.json({
         providers: [
-          { providerName: "Heck Free", key: "deepseek/deepseek-v4-flash", displayName: "DeepSeek v4 Flash", isPremium: false },
-          { providerName: "Heck Free", key: "deepseek/deepseek-v4-pro", displayName: "DeepSeek v4 Pro", isPremium: false },
-          { providerName: "Heck Free", key: "google/gemini-3.1-flash-lite", displayName: "Gemini 3.1 Flash Lite", isPremium: false },
-          { providerName: "Heck Free", key: "openai/gpt-5.4-mini", displayName: "GPT 5.4 mini", isPremium: false },
-          { providerName: "Heck Premium", key: "anthropic/claude-opus-4.8", displayName: "Claude Opus 4.8", isPremium: true },
-          { providerName: "Heck Premium", key: "anthropic/claude-sonnet-4.6", displayName: "Claude Sonnet 4.6", isPremium: true },
-          { providerName: "Heck Premium", key: "google/gemini-3.1-pro-preview", displayName: "Gemini 3.1 Pro", isPremium: true },
-          { providerName: "Heck Premium", key: "google/gemini-3.5-flash", displayName: "Gemini 3.5 Flash", isPremium: true },
-          { providerName: "Heck Premium", key: "openai/gpt-5.4", displayName: "GPT 5.4", isPremium: true },
-          { providerName: "Heck Premium", key: "x-ai/grok-4.3", displayName: "Grok 4.3", isPremium: true }
-        ]
+          {
+            providerName: "Heck Free",
+            key: "deepseek/deepseek-v4-flash",
+            displayName: "DeepSeek v4 Flash",
+            isPremium: false,
+          },
+          {
+            providerName: "Heck Free",
+            key: "deepseek/deepseek-v4-pro",
+            displayName: "DeepSeek v4 Pro",
+            isPremium: false,
+          },
+          {
+            providerName: "Heck Free",
+            key: "google/gemini-3.1-flash-lite",
+            displayName: "Gemini 3.1 Flash Lite",
+            isPremium: false,
+          },
+          {
+            providerName: "Heck Free",
+            key: "openai/gpt-5.4-mini",
+            displayName: "GPT 5.4 mini",
+            isPremium: false,
+          },
+          {
+            providerName: "Heck Premium",
+            key: "anthropic/claude-opus-4.8",
+            displayName: "Claude Opus 4.8",
+            isPremium: true,
+          },
+          {
+            providerName: "Heck Premium",
+            key: "anthropic/claude-sonnet-4.6",
+            displayName: "Claude Sonnet 4.6",
+            isPremium: true,
+          },
+          {
+            providerName: "Heck Premium",
+            key: "google/gemini-3.1-pro-preview",
+            displayName: "Gemini 3.1 Pro",
+            isPremium: true,
+          },
+          {
+            providerName: "Heck Premium",
+            key: "google/gemini-3.5-flash",
+            displayName: "Gemini 3.5 Flash",
+            isPremium: true,
+          },
+          {
+            providerName: "Heck Premium",
+            key: "openai/gpt-5.4",
+            displayName: "GPT 5.4",
+            isPremium: true,
+          },
+          {
+            providerName: "Heck Premium",
+            key: "x-ai/grok-4.3",
+            displayName: "Grok 4.3",
+            isPremium: true,
+          },
+        ],
       });
     }
-    
+
     const configs = await getProviderConfigs(c.env);
     // Since only Tusk provides a dynamic list, we use it directly:
     const baseUrl = configs.tusk;
-    
+
     const response = await fetch(`${baseUrl}/api/v2/chat/providers`, {
       headers: {
-        "Accept": "application/json",
+        Accept: "application/json",
         "User-Agent": USER_AGENT,
         "use-tusk-header": "true",
       },
@@ -497,14 +838,23 @@ app.post("/api/conversations", async (c) => {
     const ip = c.req.header("cf-connecting-ip") || "unknown-ip";
     const isAllowed = await checkIpRateLimit(c.env, ip);
     if (!isAllowed) {
-      return c.json({ error: "Playground rate limit exceeded (50 requests / hour). Please use API keys for higher limits." }, 429);
+      return c.json(
+        {
+          error:
+            "Playground rate limit exceeded (50 requests / hour). Please use API keys for higher limits.",
+        },
+        429,
+      );
     }
 
     const body = await c.req.json();
     const { modelId, apiSource = "tusk" } = body;
-    
+
     if (apiSource === "heck") {
-      return c.json({ chatId: apiSource + "-" + Date.now(), sessionId: apiSource + "-session" });
+      return c.json({
+        chatId: apiSource + "-" + Date.now(),
+        sessionId: apiSource + "-session",
+      });
     }
 
     const configs = await getProviderConfigs(c.env);
@@ -512,7 +862,7 @@ app.post("/api/conversations", async (c) => {
     const response = await fetch(`${baseUrl}/api/v2/chat/conversations`, {
       method: "POST",
       headers: {
-        "Accept": "application/json",
+        Accept: "application/json",
         "Content-Type": "application/json",
         "User-Agent": USER_AGENT,
         "use-tusk-header": "true",
@@ -538,12 +888,25 @@ app.post("/api/chat", async (c) => {
     const ip = c.req.header("cf-connecting-ip") || "unknown-ip";
     const isAllowed = await checkIpRateLimit(c.env, ip);
     if (!isAllowed) {
-      return c.json({ error: "Playground rate limit exceeded (50 requests / hour). Please use API keys for higher limits." }, 429);
+      return c.json(
+        {
+          error:
+            "Playground rate limit exceeded (50 requests / hour). Please use API keys for higher limits.",
+        },
+        429,
+      );
     }
 
     const body = await c.req.json();
-    const { chatId, sessionId, modelId, prompt, tone = "technical", apiSource = "tusk" } = body;
-    
+    const {
+      chatId,
+      sessionId,
+      modelId,
+      prompt,
+      tone = "technical",
+      apiSource = "tusk",
+    } = body;
+
     const configs = await getProviderConfigs(c.env);
 
     if (apiSource === "heck") {
@@ -555,7 +918,7 @@ app.post("/api/chat", async (c) => {
         body: JSON.stringify({
           model: modelId,
           question: prompt,
-          language: "en"
+          language: "en",
         }),
       });
 
@@ -566,39 +929,68 @@ app.post("/api/chat", async (c) => {
       const writer = writable.getWriter();
       const encoder = new TextEncoder();
 
-      c.executionCtx.waitUntil((async () => {
-        const reader = response.body!.getReader();
-        const decoder = new TextDecoder("utf-8");
-        try {
-          let buffer = "";
-             while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            buffer += decoder.decode(value, { stream: true });
-            const lines = buffer.split("\n");
-            buffer = lines.pop() || "";
-            for (const line of lines) {
-              if (line.startsWith("data: ")) {
-                let content = line.substring(6);
-                if (content.trim() === "[REASON_START]" || content.trim() === "[REASON_DONE]" || content.trim() === "[ANSWER_START]" || content.trim() === "[ANSWER_DONE]" || content.trim() === "[RELATE_Q_START]" || content.trim() === "[RELATE_Q_DONE]") {
-                   continue;
+      c.executionCtx.waitUntil(
+        (async () => {
+          const reader = response.body!.getReader();
+          const decoder = new TextDecoder("utf-8");
+          try {
+            let buffer = "";
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              buffer += decoder.decode(value, { stream: true });
+              const lines = buffer.split("\n");
+              buffer = lines.pop() || "";
+              for (const line of lines) {
+                if (line.startsWith("data: ")) {
+                  let content = line.substring(6);
+                  if (
+                    content.trim() === "[REASON_START]" ||
+                    content.trim() === "[REASON_DONE]" ||
+                    content.trim() === "[ANSWER_START]" ||
+                    content.trim() === "[ANSWER_DONE]" ||
+                    content.trim() === "[RELATE_Q_START]" ||
+                    content.trim() === "[RELATE_Q_DONE]"
+                  ) {
+                    continue;
+                  }
+                  const payload = {
+                    content: JSON.stringify({ content: content }),
+                  };
+                  await writer.write(
+                    encoder.encode(JSON.stringify(payload) + "\n"),
+                  );
                 }
-                const payload = {
-                  content: JSON.stringify({ content: content })
-                };
-                await writer.write(encoder.encode(JSON.stringify(payload) + "\n"));
               }
             }
+            if (buffer.startsWith("data: ")) {
+              let content = buffer.substring(6);
+              if (!(
+                content.trim() === "[REASON_START]" ||
+                content.trim() === "[REASON_DONE]" ||
+                content.trim() === "[ANSWER_START]" ||
+                content.trim() === "[ANSWER_DONE]" ||
+                content.trim() === "[RELATE_Q_START]" ||
+                content.trim() === "[RELATE_Q_DONE]"
+              )) {
+                const payload = {
+                  content: JSON.stringify({ content: content }),
+                };
+                await writer.write(
+                  encoder.encode(JSON.stringify(payload) + "\n"),
+                );
+              }
+            }
+          } finally {
+            await writer.close();
           }
-        } finally {
-          await writer.close();
-        }
-      })());
+        })(),
+      );
 
       return new Response(readable, {
         headers: {
           "Content-Type": "application/x-ndjson",
-        }
+        },
       });
     }
 
@@ -621,7 +1013,7 @@ app.post("/api/chat", async (c) => {
     const response = await fetch(`${baseUrl}/api/V2/Chat`, {
       method: "POST",
       headers: {
-        "Accept": "application/x-ndjson",
+        Accept: "application/x-ndjson",
         "Content-Type": "application/json",
         "User-Agent": USER_AGENT,
         "use-tusk-header": "true",
@@ -635,7 +1027,7 @@ app.post("/api/chat", async (c) => {
     return new Response(response.body, {
       headers: {
         "Content-Type": "application/x-ndjson",
-      }
+      },
     });
   } catch (err: any) {
     console.error("Error streaming chat:", err);
