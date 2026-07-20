@@ -4,6 +4,7 @@ import { cors } from "hono/cors";
 type Bindings = {
   lavenai: any; // KVNamespace
   ADMIN_SECRET: string;
+  ASSETS: any; // Fetcher
 };
 
 const app = new Hono<{ Bindings: Bindings }>();
@@ -1032,6 +1033,21 @@ app.post("/api/chat", async (c) => {
   } catch (err: any) {
     console.error("Error streaming chat:", err);
     return c.json({ error: err.message }, 500);
+  }
+});
+
+// Fallback for SPA routing (React)
+app.get("*", async (c) => {
+  if (c.req.path.startsWith("/api/") || c.req.path.startsWith("/v1/")) {
+    return c.json({ error: "Not found" }, 404);
+  }
+  // Serve the index.html for any other route
+  try {
+    const url = new URL(c.req.url);
+    url.pathname = "/";
+    return await c.env.ASSETS.fetch(new Request(url.toString(), c.req.raw));
+  } catch (err) {
+    return c.text("Not found", 404);
   }
 });
 
