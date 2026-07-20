@@ -250,11 +250,13 @@ app.post("/v1/chat/completions", async (c) => {
           const reader = response.body!.getReader();
           const decoder = new TextDecoder("utf-8");
           try {
-            while (true) {
+            let buffer = "";
+               while (true) {
               const { done, value } = await reader.read();
               if (done) break;
-              const chunk = decoder.decode(value, { stream: true });
-              const lines = chunk.split("\n");
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split("\n");
+            buffer = lines.pop() || "";
               for (const line of lines) {
                 if (line.startsWith("data: ")) {
                   let content = line.substring(6);
@@ -297,11 +299,13 @@ app.post("/v1/chat/completions", async (c) => {
         const reader = response.body.getReader();
         const decoder = new TextDecoder("utf-8");
         let fullText = "";
-        while (true) {
+        let buffer = "";
+           while (true) {
           const { done, value } = await reader.read();
           if (done) break;
-          const chunk = decoder.decode(value, { stream: true });
-          const lines = chunk.split("\n");
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split("\n");
+            buffer = lines.pop() || "";
           for (const line of lines) {
             if (line.startsWith("data: ")) {
               let content = line.substring(6);
@@ -366,11 +370,13 @@ app.post("/v1/chat/completions", async (c) => {
           const reader = chatResponse.body!.getReader();
           const decoder = new TextDecoder("utf-8");
           try {
-            while (true) {
+            let buffer = "";
+               while (true) {
               const { done, value } = await reader.read();
               if (done) break;
-              const chunk = decoder.decode(value, { stream: true });
-              const lines = chunk.split("\n");
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split("\n");
+            buffer = lines.pop() || "";
               for (let line of lines) {
                 if (line.trim()) {
                   try {
@@ -410,11 +416,13 @@ app.post("/v1/chat/completions", async (c) => {
         let fullText = "";
         const reader = chatResponse.body.getReader();
         const decoder = new TextDecoder("utf-8");
-        while (true) {
+        let buffer = "";
+           while (true) {
           const { done, value } = await reader.read();
           if (done) break;
-          const chunk = decoder.decode(value, { stream: true });
-          const lines = chunk.split("\n");
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split("\n");
+            buffer = lines.pop() || "";
           for (let line of lines) {
             if (line.trim()) {
               try {
@@ -562,11 +570,13 @@ app.post("/api/chat", async (c) => {
         const reader = response.body!.getReader();
         const decoder = new TextDecoder("utf-8");
         try {
-          while (true) {
+          let buffer = "";
+             while (true) {
             const { done, value } = await reader.read();
             if (done) break;
-            const chunk = decoder.decode(value, { stream: true });
-            const lines = chunk.split("\n");
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split("\n");
+            buffer = lines.pop() || "";
             for (const line of lines) {
               if (line.startsWith("data: ")) {
                 let content = line.substring(6);
